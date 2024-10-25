@@ -2,8 +2,11 @@
 name = "jsonlogprint"
 version = "0.1.0"
 edition = "2021"
+authors = ["Brandon W Maister <quodlibetor@gmail.com>"]
+license = "MIT or Apache-2.0"
 
 [dependencies]
+chrono = "0.4.38"
 clap = { version = "4.5.20", features = ["derive"] }
 colored = { version = "2.1.0" }
 indexmap = { version = "2.6.0", features = ["serde"] }
