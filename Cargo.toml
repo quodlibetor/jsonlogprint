@@ -8,9 +8,11 @@ license = "MIT or Apache-2.0"
 [dependencies]
 chrono = "0.4.38"
 clap = { version = "4.5.20", features = ["derive"] }
-colored = { version = "2.1.0" }
 indexmap = { version = "2.6.0", features = ["serde"] }
+owo-colors = { version = "4.1.0", features = ["supports-color", "supports-colors"] }
 serde = { version = "1.0.213", features = ["derive", "serde_derive"] }
 serde_json = "1.0.132"
+supports-color = "3.0.1"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+unicase = "2.8.0"
