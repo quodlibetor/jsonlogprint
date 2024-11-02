@@ -1,7 +1,8 @@
 use owo_colors::OwoColorize;
 use owo_colors::Style;
-use supports_color::Stream;
+use owo_colors::StyledList;
 use std::fmt;
+use supports_color::Stream;
 
 use crate::ColorOption;
 
@@ -14,25 +15,52 @@ impl Styler {
     pub(crate) fn new(when: ColorOption) -> Self {
         let colorize = match when {
             ColorOption::Always => true,
-            ColorOption::Auto => supports_color::on(Stream::Stdout).is_some() || std::env::var("CI").is_ok(),
+            ColorOption::Auto => {
+                supports_color::on(Stream::Stdout).is_some() || std::env::var("CI").is_ok()
+            }
             ColorOption::Never => false,
         };
         Self { colorize }
+    }
+
+    pub(crate) fn empty(self) -> CustomDisplay<'static> {
+        CustomDisplay {
+            styler: self,
+            style: DisplayStyle::Empty,
+            value: "",
+        }
     }
 
     pub(crate) fn timestamp<D: fmt::Display>(self, timestamp: &D) -> TimestampDisplay<'_, D> {
         TimestampDisplay(self, timestamp)
     }
 
-    pub(crate) fn level(self, level: &str) -> LevelDisplay<'_> {
-        LevelDisplay(self, level)
+    pub(crate) fn level(self, level: &str) -> CustomDisplay<'_> {
+        CustomDisplay {
+            styler: self,
+            style: DisplayStyle::Level,
+            value: level,
+        }
     }
 
-    pub(crate) fn depth(self, val: &str, depth: usize) -> DepthDisplay<'_> {
-        DepthDisplay {
+    pub(crate) fn depth(self, val: &str, depth: usize) -> CustomDisplay<'_> {
+        CustomDisplay {
             styler: self,
-            val,
-            depth,
+            style: DisplayStyle::Depth(depth as u16),
+            value: val,
+        }
+    }
+
+    pub(crate) fn depth_multi<'a>(
+        self,
+        value: &'a str,
+        extra: &'a str,
+        depth: usize,
+    ) -> CustomDisplay<'a> {
+        CustomDisplay {
+            styler: self,
+            style: DisplayStyle::DepthMulti(depth as u16, extra),
+            value,
         }
     }
 
@@ -43,7 +71,7 @@ impl Styler {
         Style::new().dimmed()
     }
 
-    fn depth_style(&self, depth: usize) -> Style {
+    fn depth_style(&self, depth: u16) -> Style {
         if !self.colorize {
             return Style::new();
         }
@@ -82,30 +110,45 @@ impl Styler {
     }
 }
 
+enum DisplayStyle<'a> {
+    Empty,
+    Depth(u16),
+    DepthMulti(u16, &'a str),
+    Level,
+}
+
+pub(crate) struct CustomDisplay<'a> {
+    styler: Styler,
+    style: DisplayStyle<'a>,
+    value: &'a str,
+}
+
+impl<'a> fmt::Display for CustomDisplay<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.style {
+            DisplayStyle::Empty => Ok(()),
+            DisplayStyle::Depth(depth) => {
+                write!(f, "{}", self.value.style(self.styler.depth_style(depth)))
+            }
+            DisplayStyle::DepthMulti(depth, second) => {
+                let key = self.value.style(self.styler.depth_style(depth));
+                let key2 = second.style(self.styler.depth_style(depth));
+                write!(f, "{}", StyledList::from([key, key2]))
+            }
+            DisplayStyle::Level => write!(
+                f,
+                "{}",
+                self.value.style(self.styler.level_style(self.value))
+            ),
+        }
+    }
+}
+
+// TODO: Maybe move this into DisplayStyle? makes it uglier and it's not necessary now
 pub(crate) struct TimestampDisplay<'a, D: fmt::Display>(Styler, &'a D);
 
 impl<'a, D: fmt::Display> fmt::Display for TimestampDisplay<'a, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.1.style(self.0.timestamp_style()))
-    }
-}
-
-pub(crate) struct LevelDisplay<'a>(Styler, &'a str);
-
-impl<'a> fmt::Display for LevelDisplay<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.1.style(self.0.level_style(self.1)))
-    }
-}
-
-pub(crate) struct DepthDisplay<'a> {
-    styler: Styler,
-    val: &'a str,
-    depth: usize,
-}
-
-impl<'a> fmt::Display for DepthDisplay<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.val.style(self.styler.depth_style(self.depth)))
     }
 }

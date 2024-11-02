@@ -27,7 +27,7 @@ struct Args {
         short,
         long,
         value_delimiter = ',',
-        default_value = "timestamp,ts,level,msg,message"
+        default_value = "time,timestamp,ts,level,msg,message"
     )]
     no_key_fields: Vec<String>,
 
@@ -69,7 +69,6 @@ enum TimestampFormat {
     Raw,
 }
 
-
 fn main() {
     let args = Args::parse();
 
@@ -105,10 +104,18 @@ fn init_logging() {
     });
 }
 
+struct Reusable {
+    map: IndexMap<String, JsonValue>,
+    newline_fields: Vec<usize>,
+}
+
 fn transform_lines(handle: impl BufRead, mut out: impl Write, args: Args) {
     // Reuse the same map for each line
-    let mut reusable_map = IndexMap::new();
-    let styler = Styler::new(args.color );
+    let mut reusable = Reusable {
+        map: IndexMap::new(),
+        newline_fields: Vec::new(),
+    };
+    let styler = Styler::new(args.color);
 
     for line in handle.lines() {
         match line {
@@ -117,13 +124,13 @@ fn transform_lines(handle: impl BufRead, mut out: impl Write, args: Args) {
 
                 // Deserialize directly into our reusable map using the custom seed
                 let seed = deser::IndexMapSeed {
-                    map: &mut reusable_map,
+                    map: &mut reusable.map,
                 };
 
                 match seed.deserialize(deserializer) {
                     Ok(()) => {
                         if let Err(e) = json_to_logfmt(
-                            &mut reusable_map,
+                            &mut reusable,
                             &mut out,
                             &args.no_key_fields,
                             &args.timestamp_format,
@@ -155,7 +162,7 @@ fn transform_lines(handle: impl BufRead, mut out: impl Write, args: Args) {
 }
 
 fn json_to_logfmt(
-    map: &mut IndexMap<String, JsonValue>,
+    storage: &mut Reusable,
     out: &mut impl Write,
     no_key_fields: &[String],
     timestamp_format: &TimestampFormat,
@@ -163,10 +170,11 @@ fn json_to_logfmt(
     level_field: &str,
     styler: Styler,
 ) -> io::Result<()> {
+    storage.newline_fields.clear();
     let mut first = true;
     // Print fields specified in no_key_fields first if they exist
     for key in no_key_fields {
-        if let Some(value) = map.get_mut(key) {
+        if let Some(value) = storage.map.get_mut(key) {
             if !first {
                 write!(out, " ")?;
             } else {
@@ -184,51 +192,7 @@ fn json_to_logfmt(
                     if key == timestamp_field {
                         let timestamp = num.as_i64().unwrap_or_default();
                         if *timestamp_format != TimestampFormat::Raw {
-                            // overwrite this if format is auto
-                            let mut tsfmt = *timestamp_format;
-                            let iso_datetime = match timestamp_format {
-                                TimestampFormat::Auto if timestamp > YEAR_3K_EPOCH => {
-                                    tsfmt = TimestampFormat::Millis;
-                                    DateTime::<Utc>::from_timestamp(
-                                        timestamp / 1000,
-                                        (timestamp % 1000 * 1_000_000) as u32,
-                                    )
-                                }
-                                TimestampFormat::Auto => {
-                                    tsfmt = TimestampFormat::Seconds;
-                                    DateTime::<Utc>::from_timestamp(timestamp, 0)
-                                }
-                                TimestampFormat::Seconds => {
-                                    DateTime::<Utc>::from_timestamp(timestamp, 0)
-                                }
-                                TimestampFormat::Millis => DateTime::<Utc>::from_timestamp(
-                                    timestamp / 1000,
-                                    (timestamp % 1000 * 1_000_000) as u32,
-                                ),
-                                TimestampFormat::Raw => unreachable!(),
-                            };
-
-                            match (iso_datetime, tsfmt) {
-                                (Some(dt), TimestampFormat::Seconds) => {
-                                    write!(
-                                        out,
-                                        "{}",
-                                        styler.timestamp(&dt.format("%Y-%m-%dT%H:%M:%SZ"))
-                                    )
-                                    .unwrap();
-                                }
-                                (Some(dt), TimestampFormat::Millis) => {
-                                    write!(
-                                        out,
-                                        "{}",
-                                        styler.timestamp(&dt.format("%Y-%m-%dT%H:%M:%S.%3fZ"))
-                                    )
-                                    .unwrap();
-                                }
-                                _ => {
-                                    write!(out, "{}", timestamp)?;
-                                }
-                            }
+                            try_format_datetime(timestamp_format, timestamp, out, styler)?;
                         } else {
                             write!(out, "{}", timestamp)?;
                         }
@@ -243,31 +207,81 @@ fn json_to_logfmt(
     }
 
     // Print the rest of the fields, excluding Removed variants
-    let iter_keys: Vec<String> = map.keys().cloned().collect();
-    let mut newline_fields: Vec<(String, &JsonValue)> = Vec::new();
-    for key in iter_keys {
-        if let Some(value) = map.get(&key) {
-            match value {
-                JsonValue::Removed => continue,
-                JsonValue::String(val_str) if val_str.contains('\n') => {
-                    newline_fields.push((key, value));
-                    continue;
+    for (index, (key, value)) in storage.map.iter().enumerate() {
+        match value {
+            JsonValue::Removed => continue,
+            JsonValue::String(val_str) if val_str.contains('\n') => {
+                storage.newline_fields.push(index);
+                continue;
+            }
+            _ => {
+                if !first {
+                    write!(out, " ").unwrap();
                 }
-                _ => {
-                    if !first {
-                        write!(out, " ").unwrap();
-                    }
-                    display_value_recursive(out, value, &key, 0, styler)?;
-                    first = false;
-                }
+                display_value_recursive(out, value, key, 0, styler)?;
+                first = false;
             }
         }
     }
 
     // Print fields containing newlines at the end
-    for (key, value) in newline_fields {
+    for index in &storage.newline_fields {
         writeln!(out).unwrap();
-        display_value_recursive(out, value, &key, 0, styler)?;
+        let (key, value) = storage
+            .map
+            .get_index(*index)
+            .expect("valid indices created");
+        display_value_recursive(out, value, key, 0, styler)?;
+    }
+
+    Ok(())
+}
+
+fn try_format_datetime(
+    timestamp_format: &TimestampFormat,
+    timestamp: i64,
+    out: &mut impl Write,
+    styler: Styler,
+) -> Result<(), io::Error> {
+    let mut tsfmt = *timestamp_format;
+    let iso_datetime = match timestamp_format {
+        TimestampFormat::Auto if timestamp > YEAR_3K_EPOCH => {
+            tsfmt = TimestampFormat::Millis;
+            DateTime::<Utc>::from_timestamp(timestamp / 1000, (timestamp % 1000 * 1_000_000) as u32)
+        }
+        TimestampFormat::Auto => {
+            tsfmt = TimestampFormat::Seconds;
+            DateTime::<Utc>::from_timestamp(timestamp, 0)
+        }
+        TimestampFormat::Seconds => DateTime::<Utc>::from_timestamp(timestamp, 0),
+        TimestampFormat::Millis => {
+            DateTime::<Utc>::from_timestamp(timestamp / 1000, (timestamp % 1000 * 1_000_000) as u32)
+        }
+        TimestampFormat::Raw => {
+            unreachable!("Raw timestamp format should not be used in maybe_format_datetime")
+        }
+    };
+
+    match (iso_datetime, tsfmt) {
+        (Some(dt), TimestampFormat::Seconds) => {
+            write!(
+                out,
+                "{}",
+                styler.timestamp(&dt.format("%Y-%m-%dT%H:%M:%SZ"))
+            )
+            .unwrap();
+        }
+        (Some(dt), TimestampFormat::Millis) => {
+            write!(
+                out,
+                "{}",
+                styler.timestamp(&dt.format("%Y-%m-%dT%H:%M:%S.%3fZ"))
+            )
+            .unwrap();
+        }
+        _ => {
+            write!(out, "{}", styler.timestamp(&timestamp))?;
+        }
     }
 
     Ok(())
@@ -281,25 +295,28 @@ fn display_value_recursive(
     styler: Styler,
 ) -> io::Result<()> {
     trace!(?value, ?depth, "display_value_recursive");
-    let colored_prefix = styler.depth(prefix, depth);
-    let braces = styler.depth("{", depth);
-    let braces_end = styler.depth("}", depth);
+    let (colored_prefix, sep) = if prefix.is_empty() {
+        (styler.empty(), "")
+    } else {
+        (styler.depth(prefix, depth), "=")
+    };
 
     match value {
         JsonValue::String(s) => {
             if s.contains(' ') || s.contains('"') || s.contains('\\') {
                 let val = s.replace('\\', r"\\").replace('"', r#"\""#);
-                write!(out, r#"{colored_prefix}="{val}""#)
+                write!(out, r#"{colored_prefix}{sep}"{val}""#)
             } else {
-                write!(out, "{colored_prefix}={s}")
+                write!(out, "{colored_prefix}{sep}{s}")
             }
         }
-        JsonValue::Number(n) => write!(out, "{colored_prefix}={n}"),
-        JsonValue::Bool(b) => write!(out, "{colored_prefix}={b}"),
-        JsonValue::Null => write!(out, "{colored_prefix}=null"),
+        JsonValue::Number(n) => write!(out, "{colored_prefix}{sep}{n}"),
+        JsonValue::Bool(b) => write!(out, "{colored_prefix}{sep}{b}"),
+        JsonValue::Null => write!(out, "{colored_prefix}{sep}null"),
         JsonValue::Removed => Ok(()), // This won't be used since Removed values are skipped
         JsonValue::Object(map) => {
-            write!(out, "{colored_prefix}{braces}")?;
+            let prefix_braces = styler.depth_multi(prefix, "{", depth);
+            write!(out, "{prefix_braces}")?;
             let mut first = true;
             for (key, val) in map.iter() {
                 if !first {
@@ -309,18 +326,23 @@ fn display_value_recursive(
                 }
                 display_value_recursive(out, val, key, depth + 1, styler)?
             }
+            let braces_end = styler.depth("}", depth);
             write!(out, "{braces_end}")?;
             Ok(())
         }
         JsonValue::Array(array) => {
-            write!(out, "{colored_prefix}{braces}")?;
-            for (index, value) in array.iter().enumerate() {
-                if index != 0 {
+            let braces_start = styler.depth_multi(prefix, "[", depth);
+            let mut first = true;
+            write!(out, "{braces_start}")?;
+            for value in array.iter() {
+                if !first {
                     write!(out, " ")?;
+                } else {
+                    first = false;
                 }
-                let new_key = format!("[{index}]");
-                display_value_recursive(out, value, &new_key, depth + 1, styler)?;
+                display_value_recursive(out, value, "", depth + 1, styler)?;
             }
+            let braces_end = styler.depth("]", depth);
             write!(out, "{braces_end}")?;
             Ok(())
         }
@@ -398,7 +420,7 @@ mod tests {
         init_logging();
         let input =
             r#"{"timestamp":1627494000,"level":"info","nested":{"key":"value","array":[1,2,3]}}"#;
-        let expected = "2021-07-28T17:40:00Z info nested{key=value array{[0]=1 [1]=2 [2]=3}}\n";
+        let expected = "2021-07-28T17:40:00Z info nested{key=value array[1 2 3]}\n";
 
         let input_cursor = Cursor::new(input);
         let mut output_cursor = Cursor::new(Vec::new());
@@ -436,9 +458,9 @@ mod tests {
         transform_lines(input_cursor, &mut output_cursor, args);
 
         let output = String::from_utf8(output_cursor.into_inner()).unwrap();
-        let expected = "\u{1b}[2m2021-07-28T17:40:00Z\u{1b}[0m \u{1b}[36minfo\u{1b}[0m \u{1b}[34mnested\u{1b}[0m\u{1b}[34m{\u{1b}[0m\u{1b}[36mkey\u{1b}[0m=value\u{1b}[34m}\u{1b}[0m\n";
-        eprintln!("expected: {expected}");
-        eprintln!("output  : {output}");
+        let expected = "\u{1b}[2m2021-07-28T17:40:00Z\u{1b}[0m \u{1b}[36minfo\u{1b}[0m \u{1b}[34mnested{\u{1b}[0m\u{1b}[36mkey\u{1b}[0m=value\u{1b}[34m}\u{1b}[0m\n";
+        eprint!("expected: {expected}");
+        eprint!("output  : {output}");
         assert_eq!(expected, output);
     }
 }
