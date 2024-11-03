@@ -1,7 +1,8 @@
+use std::borrow::Cow;
 use std::fmt;
 
-use serde::de::Visitor;
 use serde::de::DeserializeSeed;
+use serde::de::Visitor;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -9,22 +10,28 @@ use indexmap::IndexMap;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
-pub(crate) enum JsonValue {
-    String(String),
+pub(crate) enum JsonValue<'a> {
+    #[serde(borrow)]
+    String(Cow<'a, str>),
     Number(serde_json::Number),
     Bool(bool),
     Null,
-    Object(IndexMap<String, JsonValue>),
-    Array(Vec<JsonValue>),
+    #[serde(borrow)]
+    Object(IndexMap<&'a str, JsonValue<'a>>),
+    #[serde(borrow)]
+    Array(Vec<JsonValue<'a>>),
     Removed,
 }
 
 // Custom DeserializeSeed and Visitor
-pub(crate) struct IndexMapSeed<'a> {
-    pub(crate) map: &'a mut IndexMap<String, JsonValue>,
+pub(crate) struct IndexMapSeed<'a, 'b> {
+    pub(crate) map: &'b mut IndexMap<&'a str, JsonValue<'a>>,
 }
 
-impl<'de, 'a> DeserializeSeed<'de> for IndexMapSeed<'a> {
+impl<'de, 'a, 'b> DeserializeSeed<'de> for IndexMapSeed<'a, 'b>
+where
+    'de: 'a,
+{
     type Value = ();
 
     fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
@@ -35,7 +42,10 @@ impl<'de, 'a> DeserializeSeed<'de> for IndexMapSeed<'a> {
     }
 }
 
-impl<'de, 'a> Visitor<'de> for IndexMapSeed<'a> {
+impl<'de, 'a, 'b> Visitor<'de> for IndexMapSeed<'a, 'b>
+where
+    'de: 'a,
+{
     type Value = ();
 
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -46,10 +56,8 @@ impl<'de, 'a> Visitor<'de> for IndexMapSeed<'a> {
     where
         M: serde::de::MapAccess<'de>,
     {
-        // Clear the map to reuse
-        self.map.clear();
-
-        while let Some((key, value)) = access.next_entry::<String, JsonValue>()? {
+        while let Some((key, value)) = access.next_entry::<&'a str, JsonValue<'a>>()? {
+            tracing::debug!(?key, ?value, "inserting key-value pair");
             self.map.insert(key, value);
         }
         Ok(())

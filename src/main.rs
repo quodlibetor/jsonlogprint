@@ -104,8 +104,8 @@ fn init_logging() {
     });
 }
 
-struct Reusable {
-    map: IndexMap<String, JsonValue>,
+struct Reusable<'a> {
+    map: IndexMap<&'a str, JsonValue<'a>>,
     newline_fields: Vec<usize>,
 }
 
@@ -120,38 +120,7 @@ fn transform_lines(handle: impl BufRead, mut out: impl Write, args: Args) {
     for line in handle.lines() {
         match line {
             Ok(json_line) => {
-                let deserializer = &mut serde_json::Deserializer::from_str(&json_line);
-
-                // Deserialize directly into our reusable map using the custom seed
-                let seed = deser::IndexMapSeed {
-                    map: &mut reusable.map,
-                };
-
-                match seed.deserialize(deserializer) {
-                    Ok(()) => {
-                        if let Err(e) = json_to_logfmt(
-                            &mut reusable,
-                            &mut out,
-                            &args.no_key_fields,
-                            &args.timestamp_format,
-                            &args.timestamp_field,
-                            &args.level_field,
-                            styler,
-                        ) {
-                            debug!("Failed to format JSON line: {}", e);
-                            writeln!(out).unwrap();
-                            writeln!(out, "{}", json_line).unwrap();
-                        }
-                        writeln!(out).unwrap();
-                    }
-                    Err(e) => {
-                        debug!(
-                            "Failed to deserialize JSON line: {} with error: {}",
-                            json_line, e
-                        );
-                        writeln!(out, "{}", json_line).unwrap();
-                    }
-                }
+                process_line(json_line, &mut reusable, &mut out, &args, styler);
             }
             Err(e) => {
                 warn!("Failed to read line from stdin: {}", e);
@@ -159,6 +128,61 @@ fn transform_lines(handle: impl BufRead, mut out: impl Write, args: Args) {
             }
         }
     }
+}
+
+fn process_line(
+    json_line: String,
+    reusable: &mut Reusable<'_>,
+    out: &mut impl Write,
+    args: &Args,
+    styler: Styler,
+) {
+    // SAFETY: the reusable map contents don't outlive the json_line
+    //
+    // This function does not return a result, so it's impossible to early exit
+    // accidentally with ?, and there are no `return` statements.
+    let result = {
+        let mut deserializer = unsafe {
+            std::mem::transmute::<
+                serde_json::Deserializer<serde_json::de::StrRead<'_>>,
+                serde_json::Deserializer<serde_json::de::StrRead<'static>>,
+            >(serde_json::Deserializer::from_str(&json_line))
+        };
+
+        let seed = deser::IndexMapSeed {
+            map: &mut reusable.map,
+        };
+        seed.deserialize(&mut deserializer)
+    };
+
+    match result {
+        Ok(()) => {
+            if let Err(e) = json_to_logfmt(
+                reusable,
+                out,
+                &args.no_key_fields,
+                &args.timestamp_format,
+                &args.timestamp_field,
+                &args.level_field,
+                styler,
+            ) {
+                debug!("Failed to format JSON line: {}", e);
+                writeln!(out).unwrap();
+                writeln!(out, "{}", json_line).unwrap();
+            }
+            writeln!(out).unwrap();
+        }
+        Err(e) => {
+            debug!(
+                line = %json_line,
+                error = %e,
+                "Failed to deserialize JSON line",
+            );
+            writeln!(out, "{}", json_line).unwrap();
+        }
+    }
+    reusable.map.clear();
+    reusable.newline_fields.clear();
 }
 
 fn json_to_logfmt(
@@ -174,7 +198,7 @@ fn json_to_logfmt(
     let mut first = true;
     // Print fields specified in no_key_fields first if they exist
     for key in no_key_fields {
-        if let Some(value) = storage.map.get_mut(key) {
+        if let Some(value) = storage.map.get_mut(key.as_str()) {
             if !first {
                 write!(out, " ")?;
             } else {
@@ -462,5 +486,27 @@ mod tests {
         eprint!("expected: {expected}");
         eprint!("output  : {output}");
         assert_eq!(expected, output);
+    }
+
+    #[test]
+    fn test_transform_lines_non_json_passthrough() {
+        init_logging();
+        let input = "This is not JSON\nNeither is this line\n{also not json}\n";
+
+        let input_cursor = Cursor::new(input);
+        let mut output_cursor = Cursor::new(Vec::new());
+
+        let args = Args {
+            no_key_fields: vec!["timestamp".to_string(), "level".to_string()],
+            color: ColorOption::Never,
+            timestamp_format: TimestampFormat::Seconds,
+            timestamp_field: "timestamp".to_string(),
+            level_field: "level".to_string(),
+        };
+
+        transform_lines(input_cursor, &mut output_cursor, args);
+
+        let output = String::from_utf8(output_cursor.into_inner()).unwrap();
+        assert_eq!(input, output);
     }
 }
