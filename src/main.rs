@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use indexmap::IndexMap;
 use clap::Parser;
 use colored::*;
-use tracing::{debug};
+use tracing::debug;
 use tracing_subscriber::{self, EnvFilter};
 
 #[derive(Parser, Debug)]
@@ -32,7 +32,8 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .init();
-     colored::control::set_override(true);
+
+    colored::control::set_override(true);
 
     let args = Args::parse();
     let no_key_fields = if args.no_key_fields.is_empty() {
@@ -112,33 +113,67 @@ fn json_to_logfmt(mut map: IndexMap<String, JsonValue>, handle_out: &mut dyn Wri
         if !first {
             write!(handle_out, " ").unwrap();
         }
-        write!(handle_out, "{}={}", key.blue(), value_to_string(&value)).unwrap();
+        write!(handle_out, "{}", value_to_string_recursive(&value, &key, 0, true)).unwrap();
         first = false;
     }
 
     // Print fields containing newlines at the end
     for (key, value) in newline_fields {
         writeln!(handle_out).unwrap();
-        write!(handle_out, "{}={}", key.blue(), value_to_string(&value)).unwrap();
+        write!(handle_out, "{}", value_to_string_recursive(&value, &key, 0, true)).unwrap();
     }
 
     Some(())
 }
 
-fn value_to_string(value: &JsonValue) -> String {
+fn value_to_string_recursive(value: &JsonValue, prefix: &str, depth: usize, is_outermost: bool) -> String {
+    let colored_prefix = key_color(prefix, depth);
+    let dimmed_braces = "{".dimmed();
+    let dimmed_braces_end = "}".dimmed();
     match value {
         JsonValue::String(s) => {
             if s.contains(' ') || s.contains('"') || s.contains('\\') {
-                format!(r#""{}""#, s.replace('\\', r"\\").replace('"', r#"\""#))
+                format!(r#"{colored_prefix}="{}""#, s.replace('\\', r"\\").replace('"', r#"\""#))
             } else {
-                s.clone()
+                format!("{colored_prefix}={}", s)
             }
         }
-        JsonValue::Number(n) => n.to_string(),
-        JsonValue::Bool(b) => b.to_string(),
-        JsonValue::Null => "null".to_string(),
+        JsonValue::Number(n) => format!("{colored_prefix}={}", n),
+        JsonValue::Bool(b) => format!("{colored_prefix}={}", b),
+        JsonValue::Null => format!("{colored_prefix}=null"),
         JsonValue::Removed => String::new(), // This won't be used since Removed values are skipped
-        JsonValue::Object(_) | JsonValue::Array(_) => "<complex>".to_string(),
+        JsonValue::Object(map) => {
+            let mut parts = Vec::new();
+            for (key, value) in map {
+                parts.push(value_to_string_recursive(value, key, depth + 1, false));
+            }
+            if is_outermost {
+                format!("{colored_prefix}{dimmed_braces}{}{dimmed_braces_end}", parts.join(" "))
+            } else {
+                format!("{colored_prefix}{dimmed_braces}{}{}", parts.join(" "), dimmed_braces_end)
+            }
+        }
+        JsonValue::Array(array) => {
+            let mut parts = Vec::new();
+            for (index, value) in array.iter().enumerate() {
+                let new_key = format!("[{index}]");
+                parts.push(value_to_string_recursive(value, &new_key, depth + 1, false));
+            }
+            if is_outermost {
+                format!("{colored_prefix}{dimmed_braces} {} {dimmed_braces_end}", parts.join(" "))
+            } else {
+                format!("{colored_prefix}{dimmed_braces}{}{}", parts.join(" "), dimmed_braces_end)
+            }
+        }
+    }
+}
+
+fn key_color(key: &str, depth: usize) -> ColoredString {
+    match depth % 3 {
+        0 => key.blue(),
+        1 => key.cyan(),
+        2 => key.green(),
+        _ => key.normal(),
     }
 }
 
