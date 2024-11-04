@@ -4,7 +4,7 @@ use owo_colors::StyledList;
 use std::fmt;
 use supports_color::Stream;
 
-use crate::ColorOption;
+use crate::cfg::ColorOption;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Styler {

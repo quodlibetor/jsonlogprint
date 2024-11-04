@@ -6,7 +6,7 @@ use serde::de::Visitor;
 use serde::Deserialize;
 use serde::Serialize;
 
-use indexmap::IndexMap;
+use crate::FnvIndexMap;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
@@ -17,7 +17,7 @@ pub(crate) enum JsonValue<'a> {
     Bool(bool),
     Null,
     #[serde(borrow)]
-    Object(IndexMap<&'a str, JsonValue<'a>>),
+    Object(FnvIndexMap<&'a str, JsonValue<'a>>),
     #[serde(borrow)]
     Array(Vec<JsonValue<'a>>),
     Removed,
@@ -25,7 +25,7 @@ pub(crate) enum JsonValue<'a> {
 
 // Custom DeserializeSeed and Visitor
 pub(crate) struct IndexMapSeed<'a, 'b> {
-    pub(crate) map: &'b mut IndexMap<&'a str, JsonValue<'a>>,
+    pub(crate) map: &'b mut FnvIndexMap<&'a str, JsonValue<'a>>,
 }
 
 impl<'de, 'a, 'b> DeserializeSeed<'de> for IndexMapSeed<'a, 'b>

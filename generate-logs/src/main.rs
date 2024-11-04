@@ -1,7 +1,7 @@
 use chrono::Utc;
 use rand::Rng;
 use serde_json::json;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 
 const MESSAGES: &[&str] = &[
     "Application started",
@@ -27,7 +27,7 @@ fn main() {
 
     let mut rng = rand::thread_rng();
     let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
+    let mut handle = BufWriter::with_capacity(32 * 1024, stdout.lock()); // 32KB buffer
 
     for _ in 0..count {
         let message = MESSAGES[rng.gen_range(0..MESSAGES.len())];

@@ -4,10 +4,28 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Brandon W Maister <quodlibetor@gmail.com>"]
 license = "MIT or Apache-2.0"
+repository = "https://github.com/quodlibetor/jsonlogprint"
+homepage = "https://github.com/quodlibetor/jsonlogprint"
+publish = false
+description = """Pretty print json logs
+
+For when you need to watch json logs in a terminal
+and you just want them to be easier to read.
+"""
+
+[package.metadata.dist]
+dist = true
+
+[package.metadata.wix]
+upgrade-guid = "F12C26E3-7502-4CC0-AE97-1F312E662CAE"
+path-guid = "C3AA5FB9-9344-4B86-8A2C-B006BFF9614D"
+license = false
+eula = false
 
 [dependencies]
 chrono = "0.4.38"
 clap = { version = "4.5.20", features = ["derive"] }
+fnv = "1.0.7"
 indexmap = { version = "2.6.0", features = ["serde"] }
 owo-colors = { version = "4.1.0" }
 serde = { version = "1.0.214", features = ["derive", "serde_derive"] }

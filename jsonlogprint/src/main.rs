@@ -1,8 +1,10 @@
+use chrono::format::Item;
 use chrono::{DateTime, Utc};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
+use fnv::FnvBuildHasher;
 use indexmap::IndexMap;
 use serde::de::DeserializeSeed as _;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufWriter, Write};
 use tracing::{debug, trace, warn};
 use tracing_subscriber::{self, EnvFilter};
 
@@ -10,6 +12,7 @@ use deser::JsonValue;
 
 use self::styler::Styler;
 
+mod cfg;
 mod deser;
 mod styler;
 
@@ -19,68 +22,21 @@ mod styler;
 /// using millis or seconds.
 const YEAR_3K_EPOCH: i64 = 32503698000;
 
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Fields to print at the beginning of the log line without a key prefix
-    #[arg(
-        short,
-        long,
-        value_delimiter = ',',
-        default_value = "time,timestamp,ts,level,msg,message"
-    )]
-    no_key_fields: Vec<String>,
-
-    /// Color output settings: always, auto, never
-    #[arg(long, value_enum, default_value = "auto")]
-    color: ColorOption,
-
-    /// Timestamp format.
-    ///
-    /// Auto, Seconds or Millis will be converted to ISO format in output,
-    /// Raw means it is not processed.
-    #[arg(long, visible_alias = "tsfmt", value_enum, default_value = "auto")]
-    timestamp_format: TimestampFormat,
-
-    /// The field to use as the timestamp.
-    ///
-    /// If the field is an integer, it will be parsed according to --timestamp-format
-    #[arg(long, default_value = "timestamp")]
-    timestamp_field: String,
-
-    /// The field to use as the log level.
-    /// If the field is a string, it will be colorized.
-    #[arg(long, default_value = "level")]
-    level_field: String,
-}
-
-#[derive(ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
-enum ColorOption {
-    Always,
-    Auto,
-    Never,
-}
-
-#[derive(ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
-enum TimestampFormat {
-    Auto,
-    Seconds,
-    Millis,
-    Raw,
-}
+type FnvIndexMap<K, V> = IndexMap<K, V, FnvBuildHasher>;
 
 fn main() {
-    let args = Args::parse();
+    let args = cfg::Args::parse();
+    let config = cfg::Config::new(args);
 
     init_logging();
-    debug!(config = ?args, "starting up");
+    debug!(config = ?config, "starting up");
 
     let stdin = io::stdin();
     let handle = stdin.lock();
     let stdout = io::stdout();
-    let handle_out = stdout.lock();
+    let handle_out = BufWriter::with_capacity(32 * 1024, stdout.lock());
 
-    transform_lines(handle, handle_out, args);
+    transform_lines(handle, handle_out, config);
 }
 
 fn init_logging() {
@@ -105,22 +61,23 @@ fn init_logging() {
 }
 
 struct Reusable<'a> {
-    map: IndexMap<&'a str, JsonValue<'a>>,
+    map: FnvIndexMap<&'a str, JsonValue<'a>>,
     newline_fields: Vec<usize>,
 }
 
-fn transform_lines(handle: impl BufRead, mut out: impl Write, args: Args) {
+fn transform_lines(handle: impl BufRead, mut out: impl Write, config: cfg::Config) {
     // Reuse the same map for each line
     let mut reusable = Reusable {
-        map: IndexMap::new(),
-        newline_fields: Vec::new(),
+        map: FnvIndexMap::with_capacity_and_hasher(24, FnvBuildHasher::default()),
+        newline_fields: Vec::with_capacity(config.no_key_fields.len()),
     };
-    let styler = Styler::new(args.color);
+    let styler = Styler::new(config.color);
 
     for line in handle.lines() {
         match line {
             Ok(json_line) => {
-                process_line(json_line, &mut reusable, &mut out, &args, styler);
+                process_line(json_line, &mut reusable, &mut out, &config, styler);
+                out.flush().unwrap();
             }
             Err(e) => {
                 warn!("Failed to read line from stdin: {}", e);
@@ -134,9 +91,14 @@ fn process_line(
     json_line: String,
     reusable: &mut Reusable<'_>,
     out: &mut impl Write,
-    args: &Args,
+    config: &cfg::Config,
     styler: Styler,
 ) {
+    if !json_line.starts_with('{') {
+        writeln!(out, "{}", json_line).unwrap();
+        return;
+    }
+
     // SAFETY: the reusable map contents don't outlive the json_line
     //
     // This function does not return a result, so it's impossible to early exit
@@ -157,15 +119,7 @@ fn process_line(
 
     match result {
         Ok(()) => {
-            if let Err(e) = json_to_logfmt(
-                reusable,
-                out,
-                &args.no_key_fields,
-                &args.timestamp_format,
-                &args.timestamp_field,
-                &args.level_field,
-                styler,
-            ) {
+            if let Err(e) = json_to_logfmt(reusable, out, config, styler) {
                 debug!("Failed to format JSON line: {}", e);
                 writeln!(out).unwrap();
                 writeln!(out, "{}", json_line).unwrap();
@@ -188,16 +142,13 @@ fn process_line(
 fn json_to_logfmt(
     storage: &mut Reusable,
     out: &mut impl Write,
-    no_key_fields: &[String],
-    timestamp_format: &TimestampFormat,
-    timestamp_field: &str,
-    level_field: &str,
+    config: &cfg::Config,
     styler: Styler,
 ) -> io::Result<()> {
     storage.newline_fields.clear();
     let mut first = true;
     // Print fields specified in no_key_fields first if they exist
-    for key in no_key_fields {
+    for key in &config.no_key_fields {
         if let Some(value) = storage.map.get_mut(key.as_str()) {
             if !first {
                 write!(out, " ")?;
@@ -206,17 +157,24 @@ fn json_to_logfmt(
             }
             match value {
                 JsonValue::String(val_str) => {
-                    if key == level_field {
+                    if key == &config.level_field {
                         write!(out, "{}", styler.level(val_str))?;
                     } else {
                         write!(out, "{}", val_str)?;
                     }
                 }
                 JsonValue::Number(num) => {
-                    if key == timestamp_field {
+                    if key == &config.timestamp_field {
                         let timestamp = num.as_i64().unwrap_or_default();
-                        if *timestamp_format != TimestampFormat::Raw {
-                            try_format_datetime(timestamp_format, timestamp, out, styler)?;
+                        if config.timestamp_format != cfg::TimestampFormat::Raw {
+                            try_format_datetime(
+                                &config.timestamp_format,
+                                timestamp,
+                                out,
+                                styler,
+                                &config.millis_out_format,
+                                &config.secs_out_format,
+                            )?;
                         } else {
                             write!(out, "{}", timestamp)?;
                         }
@@ -262,44 +220,46 @@ fn json_to_logfmt(
 }
 
 fn try_format_datetime(
-    timestamp_format: &TimestampFormat,
+    timestamp_format: &cfg::TimestampFormat,
     timestamp: i64,
     out: &mut impl Write,
     styler: Styler,
+    millis_out_format: &[Item],
+    secs_out_format: &[Item],
 ) -> Result<(), io::Error> {
     let mut tsfmt = *timestamp_format;
     let iso_datetime = match timestamp_format {
-        TimestampFormat::Auto if timestamp > YEAR_3K_EPOCH => {
-            tsfmt = TimestampFormat::Millis;
+        cfg::TimestampFormat::Auto if timestamp > YEAR_3K_EPOCH => {
+            tsfmt = cfg::TimestampFormat::Millis;
             DateTime::<Utc>::from_timestamp(timestamp / 1000, (timestamp % 1000 * 1_000_000) as u32)
         }
-        TimestampFormat::Auto => {
-            tsfmt = TimestampFormat::Seconds;
+        cfg::TimestampFormat::Auto => {
+            tsfmt = cfg::TimestampFormat::Seconds;
             DateTime::<Utc>::from_timestamp(timestamp, 0)
         }
-        TimestampFormat::Seconds => DateTime::<Utc>::from_timestamp(timestamp, 0),
-        TimestampFormat::Millis => {
+        cfg::TimestampFormat::Seconds => DateTime::<Utc>::from_timestamp(timestamp, 0),
+        cfg::TimestampFormat::Millis => {
             DateTime::<Utc>::from_timestamp(timestamp / 1000, (timestamp % 1000 * 1_000_000) as u32)
         }
-        TimestampFormat::Raw => {
+        cfg::TimestampFormat::Raw => {
             unreachable!("Raw timestamp format should not be used in maybe_format_datetime")
         }
     };
 
     match (iso_datetime, tsfmt) {
-        (Some(dt), TimestampFormat::Seconds) => {
+        (Some(dt), cfg::TimestampFormat::Seconds) => {
             write!(
                 out,
                 "{}",
-                styler.timestamp(&dt.format("%Y-%m-%dT%H:%M:%SZ"))
+                styler.timestamp(&dt.format_with_items(secs_out_format.iter()))
             )
             .unwrap();
         }
-        (Some(dt), TimestampFormat::Millis) => {
+        (Some(dt), cfg::TimestampFormat::Millis) => {
             write!(
                 out,
                 "{}",
-                styler.timestamp(&dt.format("%Y-%m-%dT%H:%M:%S.%3fZ"))
+                styler.timestamp(&dt.format_with_items(millis_out_format.iter()))
             )
             .unwrap();
         }
@@ -378,6 +338,22 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn test_config() -> cfg::Config {
+        cfg::Config {
+            no_key_fields: vec![
+                "timestamp".to_string(),
+                "level".to_string(),
+                "msg".to_string(),
+            ],
+            color: cfg::ColorOption::Never, // Disable color for testing simplicity
+            timestamp_format: cfg::TimestampFormat::Seconds,
+            timestamp_field: "timestamp".to_string(),
+            level_field: "level".to_string(),
+            millis_out_format: cfg::default_millis_out_format(),
+            secs_out_format: cfg::default_secs_out_format(),
+        }
+    }
+
     #[test]
     fn test_transform_lines_multiple_json() {
         init_logging();
@@ -396,19 +372,9 @@ mod tests {
         let mut output_cursor = Cursor::new(Vec::new());
 
         // Set up arguments
-        let args = Args {
-            no_key_fields: vec![
-                "timestamp".to_string(),
-                "level".to_string(),
-                "msg".to_string(),
-            ],
-            color: ColorOption::Never, // Disable color for testing simplicity
-            timestamp_format: TimestampFormat::Seconds,
-            timestamp_field: "timestamp".to_string(),
-            level_field: "level".to_string(),
-        };
+        let config = test_config();
 
-        transform_lines(input_cursor, &mut output_cursor, args);
+        transform_lines(input_cursor, &mut output_cursor, config);
 
         let output = String::from_utf8(output_cursor.into_inner()).unwrap();
 
@@ -424,15 +390,10 @@ mod tests {
         let input_cursor = Cursor::new(input);
         let mut output_cursor = Cursor::new(Vec::new());
 
-        let args = Args {
-            no_key_fields: vec!["timestamp".to_string(), "level".to_string()],
-            color: ColorOption::Never,
-            timestamp_format: TimestampFormat::Seconds,
-            timestamp_field: "timestamp".to_string(),
-            level_field: "level".to_string(),
-        };
+        let mut config = test_config();
+        config.no_key_fields = vec!["timestamp".to_string(), "level".to_string()];
 
-        transform_lines(input_cursor, &mut output_cursor, args);
+        transform_lines(input_cursor, &mut output_cursor, config);
 
         let output = String::from_utf8(output_cursor.into_inner()).unwrap();
 
@@ -449,15 +410,9 @@ mod tests {
         let input_cursor = Cursor::new(input);
         let mut output_cursor = Cursor::new(Vec::new());
 
-        let args = Args {
-            no_key_fields: vec!["timestamp".to_string(), "level".to_string()],
-            color: ColorOption::Never,
-            timestamp_format: TimestampFormat::Seconds,
-            timestamp_field: "timestamp".to_string(),
-            level_field: "level".to_string(),
-        };
+        let config = test_config();
 
-        transform_lines(input_cursor, &mut output_cursor, args);
+        transform_lines(input_cursor, &mut output_cursor, config);
 
         let output = String::from_utf8(output_cursor.into_inner()).unwrap();
         assert_eq!(expected, output);
@@ -471,15 +426,10 @@ mod tests {
         let input_cursor = Cursor::new(input);
         let mut output_cursor = Cursor::new(Vec::new());
 
-        let args = Args {
-            no_key_fields: vec!["timestamp".to_string(), "level".to_string()],
-            color: ColorOption::Always,
-            timestamp_format: TimestampFormat::Seconds,
-            timestamp_field: "timestamp".to_string(),
-            level_field: "level".to_string(),
-        };
+        let mut config = test_config();
+        config.color = cfg::ColorOption::Always;
 
-        transform_lines(input_cursor, &mut output_cursor, args);
+        transform_lines(input_cursor, &mut output_cursor, config);
 
         let output = String::from_utf8(output_cursor.into_inner()).unwrap();
         let expected = "\u{1b}[2m2021-07-28T17:40:00Z\u{1b}[0m \u{1b}[36minfo\u{1b}[0m \u{1b}[34mnested{\u{1b}[0m\u{1b}[36mkey\u{1b}[0m=value\u{1b}[34m}\u{1b}[0m\n";
@@ -496,15 +446,9 @@ mod tests {
         let input_cursor = Cursor::new(input);
         let mut output_cursor = Cursor::new(Vec::new());
 
-        let args = Args {
-            no_key_fields: vec!["timestamp".to_string(), "level".to_string()],
-            color: ColorOption::Never,
-            timestamp_format: TimestampFormat::Seconds,
-            timestamp_field: "timestamp".to_string(),
-            level_field: "level".to_string(),
-        };
+        let config = test_config();
 
-        transform_lines(input_cursor, &mut output_cursor, args);
+        transform_lines(input_cursor, &mut output_cursor, config);
 
         let output = String::from_utf8(output_cursor.into_inner()).unwrap();
         assert_eq!(input, output);
