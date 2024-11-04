@@ -4,6 +4,9 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
+[package.metadata.dist]
+dist = false
+
 [dependencies]
 chrono = "0.4.38"
 rand = "0.8"
