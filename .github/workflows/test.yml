@@ -18,7 +18,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - run: cargo fmt --all -- --check
+      - run: cargo fmt --all -- --color=always --check
       - run: cargo clippy --all-features -- -D warnings
 
   test:
@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --all-features
+      - run: cargo test --all-features -- --color=always
 
   miri:
     name: Miri Tests
@@ -37,6 +37,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      - run: cargo miri test --all-features
+      - run: cargo miri test --all-features -- --color=always
         env:
           MIRIFLAGS: -Zmiri-disable-isolation

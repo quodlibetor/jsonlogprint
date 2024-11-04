@@ -57,7 +57,6 @@ where
         M: serde::de::MapAccess<'de>,
     {
         while let Some((key, value)) = access.next_entry::<&'a str, JsonValue<'a>>()? {
-            tracing::debug!(?key, ?value, "inserting key-value pair");
             self.map.insert(key, value);
         }
         Ok(())
