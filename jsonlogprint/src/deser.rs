@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::fmt;
 
 use serde::de::DeserializeSeed;
@@ -12,7 +11,7 @@ use crate::FnvIndexMap;
 #[serde(untagged)]
 pub(crate) enum JsonValue<'a> {
     #[serde(borrow)]
-    String(Cow<'a, str>),
+    String(&'a str),
     Number(serde_json::Number),
     Bool(bool),
     Null,
